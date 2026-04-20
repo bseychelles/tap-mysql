@@ -126,6 +126,15 @@ class TapMySQL(SQLTap):
             ),
         ),
         th.Property(
+            "synthetic_replication_keys",
+            th.ObjectType(),
+            description=(
+                "Optional per-stream synthetic replication key definitions. "
+                "Example: {'acheel-contracts': {'name': 'cursor_ts', 'sql': "
+                "'coalesce(updated_at, created_at)', 'type': 'datetime'}}"
+            ),
+        ),
+        th.Property(
             "is_vitess",
             th.BooleanType,
             default=None,

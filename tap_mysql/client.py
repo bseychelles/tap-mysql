@@ -219,6 +219,68 @@ class MySQLConnector(SQLConnector):
             return self.config["filter_schemas"]
         return super().get_schema_names(engine, inspected)
 
+    def get_synthetic_replication_key_config(
+        self,
+        stream_name: str,
+        *,
+        available_columns: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return synthetic replication key config for a stream, if any."""
+        synthetic_keys = self.config.get("synthetic_replication_keys") or {}
+        if isinstance(synthetic_keys, dict):
+            for key in (stream_name, stream_name.casefold(), "*"):
+                stream_config = synthetic_keys.get(key)
+                if (
+                    isinstance(stream_config, dict)
+                    and stream_config.get("name")
+                    and stream_config.get("sql")
+                ):
+                    return stream_config
+
+        column_names = {column.casefold() for column in available_columns or []}
+        if {"updated_at", "created_at"}.issubset(column_names):
+            return {
+                "name": "cursor_ts",
+                "sql": "coalesce(updated_at, created_at)",
+                "type": "datetime",
+            }
+        return None
+
+    @staticmethod
+    def get_synthetic_jsonschema_type(synthetic_type: str | None) -> dict[str, Any]:
+        """Return the JSON schema type for a synthetic column."""
+        if synthetic_type in {"datetime", "timestamp", "date-time"}:
+            return th.DateTimeType().type_dict
+        if synthetic_type == "date":
+            return th.DateType().type_dict
+        if synthetic_type in {"integer", "int"}:
+            return th.IntegerType().type_dict
+        if synthetic_type in {"number", "numeric", "float", "decimal"}:
+            return th.NumberType().type_dict
+        return th.StringType().type_dict
+
+    def _inject_synthetic_replication_key(
+        self,
+        catalog_entry: CatalogEntry,
+    ) -> CatalogEntry:
+        """Append the configured synthetic replication key to the stream schema."""
+        schema = catalog_entry.schema.to_dict()
+        properties = schema.setdefault("properties", {})
+        synthetic_config = self.get_synthetic_replication_key_config(
+            catalog_entry.tap_stream_id,
+            available_columns=list(properties),
+        )
+        if not synthetic_config:
+            return catalog_entry
+        synthetic_name = synthetic_config["name"]
+        if synthetic_name not in properties:
+            properties[synthetic_name] = self.get_synthetic_jsonschema_type(
+                synthetic_config.get("type", "datetime"),
+            )
+            catalog_entry.schema = Schema.from_dict(schema)
+
+        return catalog_entry
+
     def discover_catalog_entry(  # noqa: PLR0913
         self,
         engine: Engine,
@@ -247,7 +309,7 @@ class MySQLConnector(SQLConnector):
             `CatalogEntry` object for the given table or a view
         """
         if self.is_vitess is False or is_view is False:
-            return super().discover_catalog_entry(
+            catalog_entry = super().discover_catalog_entry(
                 engine,
                 inspected,
                 schema_name,
@@ -257,6 +319,7 @@ class MySQLConnector(SQLConnector):
                 reflected_pk=reflected_pk,
                 reflected_indices=reflected_indices,
             )
+            return self._inject_synthetic_replication_key(catalog_entry)
         # For vitess views, we can't use DESCRIBE as it's not supported for
         # views so we do the below.
         unique_stream_id = str(
@@ -298,25 +361,27 @@ class MySQLConnector(SQLConnector):
         replication_method = next(reversed(["FULL_TABLE", *addl_replication_methods]))
 
         # Create the catalog entry object
-        return CatalogEntry(
-            tap_stream_id=unique_stream_id,
-            stream=unique_stream_id,
-            table=table_name,
-            key_properties=None,
-            schema=Schema.from_dict(schema),
-            is_view=is_view,
-            replication_method=replication_method,
-            metadata=MetadataMapping.get_standard_metadata(
-                schema_name=schema_name,
-                schema=schema,
-                replication_method=replication_method,
+        return self._inject_synthetic_replication_key(
+            CatalogEntry(
+                tap_stream_id=unique_stream_id,
+                stream=unique_stream_id,
+                table=table_name,
                 key_properties=None,
-                valid_replication_keys=None,  # Must be defined by user
-            ),
-            database=None,  # Expects single-database context
-            row_count=None,
-            stream_alias=None,
-            replication_key=None,  # Must be defined by user
+                schema=Schema.from_dict(schema),
+                is_view=is_view,
+                replication_method=replication_method,
+                metadata=MetadataMapping.get_standard_metadata(
+                    schema_name=schema_name,
+                    schema=schema,
+                    replication_method=replication_method,
+                    key_properties=None,
+                    valid_replication_keys=None,  # Must be defined by user
+                ),
+                database=None,  # Expects single-database context
+                row_count=None,
+                stream_alias=None,
+                replication_key=None,  # Must be defined by user
+            )
         )
 
     def get_sqlalchemy_type(self, col_meta_type: str) -> sqlalchemy.Column:
@@ -432,9 +497,30 @@ class MySQLStream(SQLStream):
 
         # pulling rows with only selected columns from stream
         selected_column_names = list(self.get_selected_schema()["properties"])
+        synthetic_config = self.connector.get_synthetic_replication_key_config(
+            self.name,
+            available_columns=selected_column_names,
+        )
+        synthetic_name = synthetic_config["name"] if synthetic_config else None
+        effective_replication_key = self.replication_key or self.stream_state.get(
+            "replication_key",
+        )
+        include_synthetic = bool(
+            synthetic_config
+            and (
+                synthetic_name in selected_column_names
+                or effective_replication_key == synthetic_name
+            )
+        )
+
+        physical_column_names = [
+            column_name
+            for column_name in selected_column_names
+            if column_name != synthetic_name
+        ]
         table = self.connector.get_table(
             self.fully_qualified_name,
-            column_names=selected_column_names,
+            column_names=physical_column_names,
         )
 
         # Apply TypeDecorators to Date and  DateTime columns
@@ -444,14 +530,42 @@ class MySQLStream(SQLStream):
             elif isinstance(column.type, Date):
                 column.type = ZeroDateToNull()
 
+        query_columns = [
+            table.columns[column_name]
+            for column_name in physical_column_names
+            if column_name in table.columns
+        ]
 
-        query = table.select()
-        if self.replication_key:
-            replication_key_col = table.columns[self.replication_key]
+        synthetic_replication_key_col = None
+        if include_synthetic and synthetic_config:
+            synthetic_replication_key_col = sqlalchemy.literal_column(
+                synthetic_config["sql"],
+            )
+            query_columns.append(
+                synthetic_replication_key_col.label(synthetic_name),
+            )
+
+        query = sqlalchemy.select(*query_columns).select_from(table)
+        if effective_replication_key:
+            if (
+                effective_replication_key == synthetic_name
+                and synthetic_replication_key_col is not None
+            ):
+                replication_key_col = synthetic_replication_key_col
+            else:
+                replication_key_col = table.columns[effective_replication_key]
+
             query = query.order_by(replication_key_col)
 
             start_val = self.get_starting_replication_key_value(context)
-            if start_val:
+            if (
+                start_val is None
+                and effective_replication_key
+                == self.stream_state.get("replication_key")
+            ):
+                start_val = self.stream_state.get("replication_key_value")
+
+            if start_val is not None:
                 query = query.filter(replication_key_col >= start_val)
 
         with self.connector._connect() as conn:  # noqa: SLF001

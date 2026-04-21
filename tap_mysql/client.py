@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import singer_sdk.helpers._typing
 import sqlalchemy
+from sqlalchemy import event as sa_event
 from sqlalchemy.types import TypeDecorator, DateTime, Date
 from singer_sdk import SQLConnector, SQLStream
 from singer_sdk import typing as th
@@ -87,6 +88,25 @@ class MySQLConnector(SQLConnector):
             self.logger.info(
                 "Instance is not a Vitess instance, using standard configuration."
             )
+
+    def create_engine(self) -> Engine:
+        """Create SQLAlchemy engine with extended MySQL session timeouts.
+
+        Overrides the default engine to set net_read_timeout and
+        net_write_timeout at the session level, preventing dropped connections
+        on large result sets that take more than the server's default 30s.
+        """
+        engine = super().create_engine()
+
+        @sa_event.listens_for(engine, "connect")
+        def set_session_timeouts(dbapi_conn, connection_record):  # noqa: ANN001, ANN202
+            cursor = dbapi_conn.cursor()
+            cursor.execute("SET SESSION net_read_timeout=600")
+            cursor.execute("SET SESSION net_write_timeout=600")
+            cursor.execute("SET SESSION wait_timeout=28800")
+            cursor.close()
+
+        return engine
 
     @staticmethod
     def to_jsonschema_type(
